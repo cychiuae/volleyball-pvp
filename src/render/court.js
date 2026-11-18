@@ -412,6 +412,10 @@ function buildDecor(root, uTime, decals) {
     else shell(soft, x, z, R() * 6.28);
   }
 
+  // --- inland "back beach" behind the +z baseline: the backdrop of the team-1 (Mint) camera,
+  // which looks toward +z (team 0 looks out to sea). Beach huts, a dune fence, grassy dunes.
+  backBeach(lined, soft, decals, R);
+
   // --- distant islands on the horizon and green hills inland
   island(soft, -140, -250, 55, 20, 30, R);
   island(soft, 70, -300, 70, 26, 34, R);
@@ -559,6 +563,94 @@ function tikiHut(lined, soft, x, z, yaw) {
     lined.add(new THREE.SphereGeometry(0.045, 6, 5), '#ffe066', mul(B, mat(-0.64 + i * 0.6, 1.32, 1.25)));
   }
   lined.add(new THREE.BoxGeometry(1.4, 0.4, 0.06), '#fff1d6', mul(B, mat(0, 2.25, 1.35)));
+}
+
+// Inland backdrop (z > 20): seen from the team-1 gameplay camera and the menu / result orbits.
+// Everything is merged into the two decor meshes (no extra draw calls); ~9k triangles total.
+function backBeach(lined, soft, decals, R) {
+  // Row of pastel beach huts facing the court, a gap in the middle for the boardwalk.
+  const hutCols = ['#ff8fab', '#5ed3b5', '#ffd43b', '#b197fc', '#4dabf7', '#ff9f6b'];
+  [-21, -16.5, -12, 12, 16.5, 21].forEach((x, i) => {
+    const z = 24.5 + R() * 1.5;
+    beachHut(lined, x, z, Math.PI + (R() - 0.5) * 0.25 - x * 0.012, hutCols[i]);
+    decals.push([x, z, 3.6, 3.6, 0]);
+  });
+  // Boardwalk from the court area up through the dunes, with a cute striped arch.
+  for (let i = 0; i < 26; i++) {
+    const z = 19 + i * 0.9;
+    lined.add(new THREE.BoxGeometry(2.6, 0.1, 0.78), i % 2 ? '#e3b47c' : '#d9a76e', mat((R() - 0.5) * 0.06, 0.05, z, 0, (R() - 0.5) * 0.03, 0));
+  }
+  for (const sx of [-1, 1]) {
+    lined.add(new THREE.CylinderGeometry(0.13, 0.15, 3.4, 8), (c) => (Math.floor((c.y + 1.7) / 0.42) % 2 ? '#ffffff' : '#ff8fab'), mat(sx * 1.7, 1.7, 21));
+    lined.add(new THREE.SphereGeometry(0.2, 10, 8), '#ffd43b', mat(sx * 1.7, 3.5, 21));
+  }
+  lined.add(new THREE.BoxGeometry(3.0, 0.62, 0.12), (c) => (Math.abs(c.x) < 1.25 && Math.abs(c.y) < 0.2 ? '#5ed3b5' : '#fff6ea'), mat(0, 3.05, 21));
+  for (let i = 0; i < 5; i++) lined.add(new THREE.SphereGeometry(0.075, 8, 6), hutCols[i], mat(-1 + i * 0.5, 3.05, 20.92));
+  // Bunting: little flags sagging between the arch and the inner huts.
+  for (const sx of [-1, 1]) {
+    const a = new THREE.Vector3(sx * 1.7, 3.2, 21), b = new THREE.Vector3(sx * 10.6, 2.9, 25);
+    const N = 11;
+    for (let k = 1; k < N; k++) {
+      const t = k / N;
+      const p = a.clone().lerp(b, t);
+      p.y -= Math.sin(Math.PI * t) * 0.7;
+      const yaw = Math.atan2(b.x - a.x, b.z - a.z) + Math.PI / 2;
+      soft.add(new THREE.ConeGeometry(0.17, 0.4, 3), hutCols[k % hutCols.length], mat(p.x, p.y - 0.2, p.z, Math.PI, yaw, 0, 1, 1, 0.25), 0.5);
+    }
+  }
+  // Wooden dune fence (slats + two wires) in short wavy runs, gaps for the boardwalk.
+  for (const [x0, x1] of [[-30, -3], [3, 30]]) {
+    for (let x = x0; x <= x1; x += 0.42) {
+      const z = 31 + Math.sin(x * 0.21) * 1.1;
+      const h = 0.85 + R() * 0.25;
+      soft.add(new THREE.BoxGeometry(0.1, h, 0.04), R() < 0.5 ? '#c99a66' : '#b88857', mat(x, h / 2, z, 0, 0, (R() - 0.5) * 0.12));
+    }
+  }
+  // Grassy dunes behind the fence, and a green bank further back that fills the top of the view.
+  for (let i = 0; i < 16; i++) {
+    const x = -48 + i * 6.4 + (R() - 0.5) * 3;
+    if (Math.abs(x) < 4) continue;
+    const z = 38 + R() * 6, sx = 5 + R() * 3, sy = 1.6 + R() * 1.6, sz = 4 + R() * 2;
+    soft.add(new THREE.SphereGeometry(1, 16, 6, 0, Math.PI * 2, 0, Math.PI / 2), i % 2 ? '#f1d59e' : '#ecce92', mat(x, -0.05, z, 0, R() * 3, 0, sx, sy, sz));
+    // marram grass tufts on the crest (sway in the wind)
+    for (let k = 0; k < 7; k++) {
+      const a = R() * Math.PI * 2, r = Math.sqrt(R()) * 0.75;
+      const gx = x + Math.cos(a) * sx * r, gz = z + Math.sin(a) * sz * r;
+      const gy = sy * Math.sqrt(Math.max(0, 1 - r * r)) - 0.1;
+      for (let j = 0; j < 3; j++) {
+        soft.add(new THREE.ConeGeometry(0.07, 0.9 + R() * 0.5, 3), j === 1 ? '#7fcf7a' : '#9edb8f',
+          mat(gx + (j - 1) * 0.12, gy + 0.4, gz, (R() - 0.5) * 0.5, 0, (j - 1) * 0.35), (p) => THREE.MathUtils.clamp(p.y + 0.5, 0, 1) * 0.5);
+      }
+    }
+  }
+  for (let i = 0; i < 9; i++) {
+    const x = -64 + i * 16 + (R() - 0.5) * 6;
+    soft.add(new THREE.SphereGeometry(1, 18, 7, 0, Math.PI * 2, 0, Math.PI / 2), i % 2 ? '#93d487' : '#86cf7e',
+      mat(x, -0.5, 58 + R() * 10, 0, R() * 3, 0, 11 + R() * 5, 4 + R() * 3, 8 + R() * 4));
+  }
+  // A few extra palms and bushes along the dunes so the inland horizon line is lively.
+  for (const [x, z, h] of [[-25, 35, 6.8], [-6.5, 36, 6.2], [7, 37.5, 7.0], [24, 34, 6.4], [-40, 44, 7.4], [41, 46, 7.2]]) {
+    palm(lined, soft, x, z, h, 0.3 + R() * 0.5, (R() - 0.5) * 1.2, R);
+  }
+  for (const [x, z] of [[-9, 34], [10, 33.5], [-18.5, 34.5], [19, 35]]) bush(lined, x, z, 0.8 + R() * 0.4, R);
+}
+
+function beachHut(lined, x, z, yaw, color) {
+  const B = mat(x, 0, z, 0, yaw, 0);
+  const white = '#fff6ea', wood = '#d9a76e';
+  // short stilts + deck
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) lined.add(new THREE.CylinderGeometry(0.08, 0.08, 0.4, 6), wood, mul(B, mat(sx * 0.95, 0.2, sz * 0.9)));
+  lined.add(new THREE.BoxGeometry(2.3, 0.14, 2.6), wood, mul(B, mat(0, 0.45, 0.2)));
+  // striped walls (vertical stripes), door + round window on the court-facing (+z local) side
+  lined.add(new THREE.BoxGeometry(2.0, 1.9, 1.9, 6, 1, 6), (c) => (Math.floor((c.x + c.z + 4) / 0.34) % 2 ? color : white), mul(B, mat(0, 1.47, 0)));
+  lined.add(new THREE.BoxGeometry(0.62, 1.25, 0.05), white, mul(B, mat(0.35, 1.17, 0.97)));
+  lined.add(new THREE.SphereGeometry(0.05, 6, 5), '#ffd43b', mul(B, mat(0.55, 1.15, 1.0)));
+  lined.add(new THREE.CylinderGeometry(0.2, 0.2, 0.05, 12), '#bfe9ff', mul(B, mat(-0.5, 1.75, 0.97, Math.PI / 2, 0, 0)));
+  // pyramid roof with a little ball on top
+  lined.add(new THREE.ConeGeometry(1.75, 0.95, 4), color, mul(B, mat(0, 2.88, 0, 0, Math.PI / 4, 0)));
+  lined.add(new THREE.SphereGeometry(0.12, 8, 6), white, mul(B, mat(0, 3.42, 0)));
+  // a step in front
+  lined.add(new THREE.BoxGeometry(0.8, 0.12, 0.35), wood, mul(B, mat(0.35, 0.2, 1.65)));
 }
 
 function sandcastle(lined, x, z) {

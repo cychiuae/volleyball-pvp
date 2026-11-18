@@ -11,6 +11,7 @@ import { createEffects } from './render/effects.js';
 import { createCharacter } from './characters/character.js';
 import { createUI } from './ui/ui.js';
 import { createAudio } from './audio/audio.js';
+import { createNetClient } from './net/client.js';
 
 const events = createEventBus();
 const input = createInput(window);
@@ -30,27 +31,53 @@ const characters = game.state.players.map((p) => {
   return c;
 });
 
+// Online play (docs/NETWORK.md). `active` is whichever game the views render: the local
+// simulation offline, the server-driven adapter while in a room. Only ONE of them is updated per
+// frame, since both poll the same input (updating both would lose key edges).
+const net = createNetClient({ events, input });
+let active = game;
+function startSound() { audio.unlock(); audio.startMusic(); }
+
 const ui = createUI(document.getElementById('ui'), events, {
   onStart(difficulty) {
-    audio.unlock();
-    audio.startMusic();
+    startSound();
     game.startMatch({ difficulty });
   },
-  onPause() { game.pause(); },
-  onResume() { game.resume(); },
-  onRestart() { game.startMatch({ difficulty: game.state.difficulty }); },
-  onQuitToMenu() { game.toMenu(); },
+  onPause() { active.pause(); },
+  onResume() { active.resume(); },
+  onRestart() { active.startMatch({ difficulty: active.state.difficulty }); },
+  onQuitToMenu() { active.toMenu(); },
   onToggleMute() { audio.setMuted(!audio.isMuted()); return audio.isMuted(); },
+  // Online
+  onOnlineOpen() { net.connect(); },
+  onOnlineCreate(name) { startSound(); net.create(name); },
+  onOnlineJoin(code, name) { startSound(); net.join(code, name); },
+  onOnlineSlot(slot) { net.takeSlot(slot); },
+  onOnlineStart(difficulty) { startSound(); net.start(difficulty); },
+  onOnlineToLobby() { net.toLobby(); },
+  onOnlineLeave() { net.leave(); },
+});
+
+net.onStatus((st) => ui.setNetStatus(st));
+net.onRoom((room) => {
+  if (room && active !== net.game) {
+    if (game.state.phase !== 'menu') game.toMenu(); // leave any offline match behind
+    active = net.game;
+  } else if (!room && active === net.game) {
+    active = game;
+  }
+  ui.setRoom(room);
 });
 
 // Debug/test hook (used by QA scripts).
-window.__volley = { game, events, stage };
+window.__volley = { game, events, stage, net, get active() { return active; } };
 
 // Screen-space anchors for UI elements that follow the action (e.g. timing meters beside Momo,
 // avoiding Pip and the ball). Reused objects: no per-frame allocation.
 const tmpWorld = new Vector3();
-const anchors = { momo: { x: 0, y: 0 }, pip: { x: 0, y: 0 }, ball: { x: 0, y: 0 } };
-const view = { momoScreen: null, pipScreen: null, ballScreen: null };
+const anchors = { ball: { x: 0, y: 0 }, heads: [0, 1, 2, 3].map(() => ({ x: 0, y: 0 })) };
+// momoScreen/pipScreen = LOCAL player / local partner (names kept for compatibility, see ARCHITECTURE.md).
+const view = { momoScreen: null, pipScreen: null, ballScreen: null, playerScreens: [null, null, null, null] };
 function project(x, y, z, out) {
   tmpWorld.set(x, y, z).project(stage.camera);
   if (tmpWorld.z > 1) return null;
@@ -61,9 +88,13 @@ function project(x, y, z, out) {
 }
 function updateView(s) {
   const head = PLAYER.height + 0.15;
-  const [momo, pip] = s.players;
-  view.momoScreen = project(momo.pos.x, momo.pos.y + head, momo.pos.z, anchors.momo);
-  view.pipScreen = project(pip.pos.x, pip.pos.y + head, pip.pos.z, anchors.pip);
+  for (let i = 0; i < 4; i++) {
+    const p = s.players[i];
+    view.playerScreens[i] = project(p.pos.x, p.pos.y + head, p.pos.z, anchors.heads[i]);
+  }
+  const me = Number.isInteger(s.controlledId) ? s.controlledId : 0;
+  view.momoScreen = view.playerScreens[me];
+  view.pipScreen = view.playerScreens[me ^ 1]; // partner: 0<->1, 2<->3
   const b = s.ball;
   view.ballScreen = b.visible ? project(b.pos.x, b.pos.y, b.pos.z, anchors.ball) : null;
 }
@@ -75,14 +106,17 @@ function frame(now) {
   last = now;
   elapsed += dt;
 
-  game.update(dt);
-  const s = game.state;
+  active.update(dt);
+  const s = active.state;
 
   court.update(dt, elapsed, s);
   ballView.update(dt, s.ball, s);
   // View-only field for the spike wind-up pose (the game exposes the meter as state.hitCharge).
   // Guarded: a non-finite value here poisons the rig transforms and blanks the whole frame.
-  s.players[0].windup = Number.isFinite(s.hitCharge) ? s.hitCharge : null;
+  for (const p of s.players) {
+    const hc = p.meters ? p.meters.hitCharge : p.id === s.controlledId ? s.hitCharge : null;
+    p.windup = Number.isFinite(hc) ? hc : null;
+  }
   s.players.forEach((p, i) => characters[i].update(dt, p));
   effects.update(dt);
   stage.updateCamera(dt, s);

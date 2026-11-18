@@ -1,4 +1,4 @@
-// AI for CPU players and the human's teammate: picks a move target each step and
+// AI for CPU players and human teammates (any slot): picks a move target each step and
 // triggers jumps (attacks/blocks) and dives through the game context `g`.
 //
 // Perception: balls hit by the opponent are seen through g.trajFor(team), which returns the
@@ -51,8 +51,8 @@ function receive(g, p, b, tr, s) {
   if (sim.designated[T] === p.id) {
     if (g.intercept(tr, BUMP_CONTACT_Y, tmp) >= 0) b.target.set(tmp.x, 0, tmp.z);
     g.maybeDive(p, tr);
-  } else if (g.isHuman(state.players[sim.designated[T]] || p) && g.humanOutOfPosition(tr)) {
-    // Momo is nowhere near her ball: scramble for it.
+  } else if (sim.designated[T] >= 0 && g.humanOutOfPosition(tr, state.players[sim.designated[T]])) {
+    // The human teammate is nowhere near their ball: scramble for it.
     if (g.intercept(tr, 0.6, tmp) >= 0) b.target.set(tmp.x, 0, tmp.z);
     g.maybeDive(p, tr);
   } else {

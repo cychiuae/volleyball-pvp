@@ -1,10 +1,45 @@
 // DOM/CSS overlay for Cute Beach Volley: main menu, HUD (scoreboard, touch counter, serve meter,
-// pause/mute buttons), juicy popups, first-time hint, pause and game-over screens.
-// Contract: docs/ARCHITECTURE.md -> createUI(rootEl, events, callbacks) -> { update(state) }.
-// Nothing here touches window/document at import time; everything happens inside createUI.
+// pause/mute buttons), juicy popups, first-time hint, pause and game-over screens, and the online
+// screens (name/code entry, lobby, net status chip, error toasts, name tags over other humans).
+// Contract: docs/ARCHITECTURE.md -> createUI(rootEl, events, callbacks) -> { update(state, view), setRoom, setNetStatus }.
+// docs/NETWORK.md -> room object. Nothing here touches window/document at import time.
 import './ui.css';
 import { TEAMS, RULES, METER } from '../config.js';
-import { MUTE_STORAGE_KEY, playCue } from '../audio/audio.js';
+import { MUTE_STORAGE_KEY, playCue, setAudioPerspective } from '../audio/audio.js';
+
+export const NAME_STORAGE_KEY = 'cuteBeachVolley.name';
+const NAME_MAX = 12;
+// Room codes: 4 chars, no ambiguous I, O, 0, 1 (docs/NETWORK.md).
+const CODE_RE = /^[A-HJ-NP-Z2-9]{4}$/;
+/** Normalise typed room-code text: uppercase, drop spaces/punctuation, max 4. Exported for tests. */
+export function normalizeCode(text) {
+  return String(text ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4);
+}
+/** null if `code` is a valid room code, else a short reason. Exported for tests. */
+export function codeProblem(code) {
+  if (CODE_RE.test(code)) return null;
+  if (/[IO01]/.test(code)) return "Codes never use I, O, 0 or 1";
+  return 'Room codes are 4 letters';
+}
+const ERROR_TEXT = {
+  noRoom: ['No room with that code', 'Double-check the letters?'],
+  full: ['That room is full', 'Max 4 players per room'],
+  notOwner: ['Only the host can do that', ''],
+  slotTaken: ['That spot was just taken', 'Pick another one!'],
+  rateLimit: ['Whoa, slow down!', 'Too many clicks at once'],
+  badMsg: ['Something went wrong', 'Please try again'],
+  started: ['Match in progress', 'Grab a free spot at the next point'],
+};
+/** Known error code carried by a net status/error payload, or null. Exported for tests. */
+export function errorCodeOf(p) {
+  if (!p) return null;
+  if (typeof p === 'string') return ERROR_TEXT[p] ? p : (Object.keys(ERROR_TEXT).find((k) => p.includes(k)) ?? null);
+  for (const v of [p.code, p.message, p.msg]) {
+    const c = typeof v === 'string' ? errorCodeOf(v) : null;
+    if (c) return c;
+  }
+  return null;
+}
 
 const DIFFS = ['easy', 'normal', 'hard'];
 const DIFF_INFO = {
@@ -99,6 +134,29 @@ const ICON_PAUSE = `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="5
 const ICON_SOUND = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z" stroke-linejoin="round"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11" fill="none" stroke-width="2.2" stroke-linecap="round"/></svg>`;
 const ICON_MUTED = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z" stroke-linejoin="round"/><path d="M15.5 9.5l5 5M20.5 9.5l-5 5" fill="none" stroke-width="2.2" stroke-linecap="round"/></svg>`;
 
+const ICON_GLOBE = `<svg class="cbv-ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9.2" fill="#c9f5e8" stroke="currentColor" stroke-width="2.2"/><path d="M3 12h18M12 2.8c-3.2 3.4-3.2 15 0 18.4M12 2.8c3.2 3.4 3.2 15 0 18.4" fill="none" stroke="currentColor" stroke-width="1.9"/></svg>`;
+const ICON_COPY = `<svg class="cbv-ico" viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="13" rx="3" fill="#fff" stroke="currentColor" stroke-width="2.2"/><path d="M5 16V6a3 3 0 0 1 3-3h8" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>`;
+const ICON_CROWN = `<svg class="cbv-crown" viewBox="0 0 24 18" aria-label="Host"><path d="M2.5 15.5 3.5 4l5.2 5L12 2l3.3 7 5.2-5 1 11.5z" fill="#ffd43b" stroke="#3b2b3a" stroke-width="2" stroke-linejoin="round"/><circle cx="12" cy="12" r="1.6" fill="#ff8fab"/></svg>`;
+
+/** Tiny chibi face for a roster entry (TEAMS[t].players[i]) as inline SVG. */
+function faceSVG(look) {
+  const h = look.hair || '#5b3a29';
+  const k = look.skin || '#ffe0c7';
+  const ink = '#3b2b3a';
+  const st = `stroke="${ink}" stroke-width="2" stroke-linejoin="round"`;
+  let back = '';
+  if (look.hairStyle === 'bun') back = `<circle cx="20" cy="6.5" r="5" fill="${h}" ${st}/>`;
+  else if (look.hairStyle === 'pigtails') back = `<circle cx="5" cy="23" r="5" fill="${h}" ${st}/><circle cx="35" cy="23" r="5" fill="${h}" ${st}/>`;
+  else if (look.hairStyle === 'bob') back = `<path d="M5.5 22a14.5 14.5 0 0 1 29 0v9h-5V22h-19v9h-5z" fill="${h}" ${st}/>`;
+  else if (look.hairStyle === 'spiky') back = `<path d="M7 17 9 6l5 5 3-8 3.5 7L25 3l2.5 8L33 7l-1 10z" fill="${h}" ${st}/>`;
+  return `<svg class="cbv-face" viewBox="0 0 40 40" aria-hidden="true">${back}
+    <circle cx="20" cy="22.5" r="13.5" fill="${k}" ${st}/>
+    <path d="M6.6 21.5A13.5 13.5 0 0 1 33.4 21.5C29 18.5 25 16.4 20 16.4S11 18.5 6.6 21.5z" fill="${h}" ${st}/>
+    <circle cx="15" cy="25" r="1.9" fill="${ink}"/><circle cx="25" cy="25" r="1.9" fill="${ink}"/>
+    <ellipse cx="11.6" cy="29" rx="2.6" ry="1.5" fill="#ff8fab" opacity="0.6"/><ellipse cx="28.4" cy="29" rx="2.6" ry="1.5" fill="#ff8fab" opacity="0.6"/>
+    <path d="M18 29.2q2 2 4 0" fill="none" stroke="${ink}" stroke-width="1.6" stroke-linecap="round"/></svg>`;
+}
+
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const shortName = (t) => TEAMS[t].name.replace(/^Team\s+/i, '');
 
@@ -114,21 +172,27 @@ export function matchPointTeam(score, rules = RULES) {
   return null;
 }
 
-/** Popup spec for a 'hit' event, or null. Exported for tests. */
-export function hitPopup(p) {
+/**
+ * Popup spec for a 'hit' event, or null. Exported for tests.
+ * me = this screen's player: { id, team } (offline Momo = { id: 0, team: 0 }); team null = spectator.
+ */
+export function hitPopup(p, me = { id: 0, team: 0 }) {
   if (!p) return null;
-  // Momo's spikes are judged by the game's timing quality when it's reported; otherwise by power.
-  const strong = p.team === 0 && p.playerId === 0 && typeof p.quality === 'number' ? p.quality >= 0.8 : (p.power ?? 0) > 0.75;
+  const myId = me ? me.id : null;
+  const myTeam = me && (me.team === 0 || me.team === 1) ? me.team : null;
+  const ours = myTeam === null || p.team === myTeam;
+  // My spikes are judged by the game's timing quality when it's reported; otherwise by power.
+  const strong = p.playerId === myId && typeof p.quality === 'number' ? p.quality >= 0.8 : (p.power ?? 0) > 0.75;
   if (p.type === 'spike' && strong) {
-    return p.team === 0
-      ? { text: 'NICE SPIKE!', team: 0, priority: 2 }
-      : { text: 'Whoa!', team: 1, priority: 2 };
+    return ours
+      ? { text: 'NICE SPIKE!', team: p.team, priority: 2 }
+      : { text: 'Whoa!', team: p.team, priority: 2 };
   }
   if (p.type === 'block') return { text: 'BLOCK!', team: p.team, priority: 2 };
-  // No quality popups for Momo's passes/sets/digs: the pass meter verdict (PERFECT/GOOD/...) beside
-  // Momo already gives that feedback, and two messages at once read as mixed signals.
-  // Praise digs only for the player's team; the CPU digging constantly would be noisy.
-  if (p.type === 'dig' && p.team === 0 && p.playerId !== 0) return { text: 'Great dig!', team: 0, priority: 1 };
+  // No quality popups for my passes/sets/digs: the pass meter verdict (PERFECT/GOOD/...) beside
+  // my player already gives that feedback, and two messages at once read as mixed signals.
+  // Praise digs only for my team; the other side digging constantly would be noisy.
+  if (p.type === 'dig' && myTeam !== null && p.team === myTeam && p.playerId !== myId) return { text: 'Great dig!', team: p.team, priority: 1 };
   return null;
 }
 
@@ -177,6 +241,7 @@ export function createUI(rootEl, events, callbacks = {}) {
                 </button>`).join('')}
             </div>
             <button type="button" class="cbv-btn cbv-btn-big cbv-start">Start! <kbd>Enter</kbd></button>
+            <button type="button" class="cbv-btn cbv-online-btn">${ICON_GLOBE}<span>Play Online</span><span class="cbv-online-hint">with friends</span></button>
           </div>
           <div class="cbv-controls">
             <div class="cbv-controls-title">How to play</div>
@@ -193,20 +258,87 @@ export function createUI(rootEl, events, callbacks = {}) {
             <p class="cbv-note">You play ${esc(TEAMS[0].players[0].name)}. ${esc(TEAMS[0].players[1].name)} is your CPU partner and plays their own touches.</p>
           </div>
         </section>
+        <section class="cbv-panel cbv-online-panel" aria-label="Play online">
+          <h2 class="cbv-online-title">${ICON_GLOBE}<span>Play Online</span></h2>
+          <p class="cbv-online-sub">Up to 4 friends &middot; AI fills the empty spots</p>
+          <label class="cbv-field cbv-name-field"><span class="cbv-field-label">Your name</span>
+            <input class="cbv-input cbv-name-input" type="text" maxlength="${NAME_MAX}" autocomplete="nickname" spellcheck="false" placeholder="Beach buddy" aria-label="Your name">
+          </label>
+          <div class="cbv-online-actions">
+            <div class="cbv-online-card">
+              <div class="cbv-card-title">New room</div>
+              <button type="button" class="cbv-btn cbv-btn-big cbv-create">Create room</button>
+              <div class="cbv-card-note">You'll get a code to share</div>
+            </div>
+            <div class="cbv-online-or">or</div>
+            <div class="cbv-online-card">
+              <div class="cbv-card-title">Join a friend</div>
+              <div class="cbv-join-row">
+                <input class="cbv-input cbv-code-input" type="text" maxlength="6" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="ABCD" aria-label="Room code" aria-describedby="cbv-code-err">
+                <button type="button" class="cbv-btn cbv-join" disabled>Join</button>
+              </div>
+              <div class="cbv-card-note cbv-code-err" id="cbv-code-err" aria-live="polite">Ask the host for the 4-letter code</div>
+            </div>
+          </div>
+          <div class="cbv-online-foot">
+            <button type="button" class="cbv-btn cbv-online-back">Back <kbd>Esc</kbd></button>
+          </div>
+        </section>
       </div>
+    </div>
+
+    <div class="cbv-layer cbv-overlay cbv-lobby">
+      <section class="cbv-panel cbv-lobby-panel" aria-label="Lobby">
+        <div class="cbv-lobby-head">
+          <div class="cbv-code-box">
+            <span class="cbv-code-label">Room code</span>
+            <span class="cbv-code" aria-live="polite"></span>
+            <button type="button" class="cbv-btn cbv-copy" title="Copy room code">${ICON_COPY}<span class="cbv-copy-text">Copy</span></button>
+          </div>
+          <p class="cbv-lobby-sub"></p>
+        </div>
+        <div class="cbv-lobby-banner" aria-live="polite"></div>
+        <div class="cbv-lobby-teams">
+          ${[0, 1].map((t) => `<div class="cbv-lobby-team" data-team="${t}">
+            <div class="cbv-lobby-team-name"><span class="cbv-chip"></span>${esc(TEAMS[t].name)}</div>
+            <div class="cbv-slots">${[0, 1].map((i) => `<button type="button" class="cbv-slot" data-slot="${t * 2 + i}">
+              <span class="cbv-slot-face">${faceSVG(TEAMS[t].players[i])}</span>
+              <span class="cbv-slot-char">${esc(TEAMS[t].players[i].name)}</span>
+              <span class="cbv-slot-who"></span>
+              <span class="cbv-slot-act"></span>
+            </button>`).join('')}</div>
+          </div>`).join('<div class="cbv-vs">VS</div>')}
+        </div>
+        <div class="cbv-waiting"></div>
+        <div class="cbv-lobby-foot">
+          <div class="cbv-host-only">
+            <div class="cbv-lobby-label">AI difficulty</div>
+            <div class="cbv-diff cbv-lobby-diff" role="radiogroup" aria-label="AI difficulty">
+              ${DIFFS.map((d) => `<button type="button" class="cbv-btn cbv-diff-btn" role="radio" data-diff="${d}">
+                  <span class="cbv-diff-label">${DIFF_INFO[d].label}</span><span class="cbv-diff-blurb">${DIFF_INFO[d].blurb}</span>
+                </button>`).join('')}
+            </div>
+            <button type="button" class="cbv-btn cbv-btn-big cbv-lobby-start">Start match! <kbd>Enter</kbd></button>
+          </div>
+          <button type="button" class="cbv-btn cbv-to-lobby cbv-host-only cbv-lobby-end">End match &amp; back to lobby</button>
+          <div class="cbv-guest-only cbv-wait-host"><span class="cbv-wait-ball">${BALL_SVG}</span><span>Waiting for the host to start<span class="cbv-dots"><i>.</i><i>.</i><i>.</i></span></span></div>
+          <div class="cbv-lobby-keys"><span><kbd class="cbv-wide">SPACE</kbd> Jump</span><span><kbd>K</kbd> Pass/Set</span><span><kbd>J</kbd> Hit</span><span><kbd>WASD</kbd> Move</span></div>
+          <button type="button" class="cbv-btn cbv-leave">Leave room</button>
+        </div>
+      </section>
     </div>
 
     <div class="cbv-layer cbv-hud">
       <div class="cbv-score" aria-live="polite">
         <div class="cbv-score-team" data-team="0">
           <span class="cbv-serve-ball">${BALL_SVG}</span>
-          <span class="cbv-chip"></span><span class="cbv-score-name">${esc(shortName(0))}</span>
+          <span class="cbv-score-you">YOU</span><span class="cbv-chip"></span><span class="cbv-score-name">${esc(shortName(0))}</span>
           <span class="cbv-score-num">0</span>
         </div>
         <span class="cbv-score-dash">&ndash;</span>
         <div class="cbv-score-team" data-team="1">
           <span class="cbv-score-num">0</span>
-          <span class="cbv-score-name">${esc(shortName(1))}</span><span class="cbv-chip"></span>
+          <span class="cbv-score-name">${esc(shortName(1))}</span><span class="cbv-chip"></span><span class="cbv-score-you">YOU</span>
           <span class="cbv-serve-ball">${BALL_SVG}</span>
         </div>
       </div>
@@ -222,6 +354,7 @@ export function createUI(rootEl, events, callbacks = {}) {
           <div class="cbv-meter-fill"></div>
         </div>
       </div>
+      <div class="cbv-tags" aria-hidden="true">${[0, 1, 2, 3].map((i) => `<div class="cbv-tag" data-team="${i < 2 ? 0 : 1}"><span class="cbv-tag-name"></span></div>`).join('')}</div>
       <div class="cbv-hint"><span class="cbv-hint-ball">${BALL_SVG}</span><span class="cbv-hint-lines">
         <span><b>Pass/Set:</b> press <kbd>K</kbd> when the meter hits <b class="cbv-green">GREEN</b> as the ball arrives</span>
         <span><b>Spike:</b> the meter follows the ball: <kbd>SPACE</kbd> at the <b>JUMP</b> mark, release <kbd>J</kbd> in the <b class="cbv-green">GREEN</b></span>
@@ -229,20 +362,25 @@ export function createUI(rootEl, events, callbacks = {}) {
     </div>
 
     <div class="cbv-layer cbv-popups" aria-live="polite"></div>
+    <div class="cbv-layer cbv-toasts" role="status" aria-live="assertive"></div>
 
     <div class="cbv-corner">
+      <div class="cbv-net" data-status="offline" title="Connection"><span class="cbv-net-dot"></span><span class="cbv-net-text">Offline</span></div>
       <button type="button" class="cbv-btn cbv-icon-btn cbv-pause-btn" aria-label="Pause" title="Pause (Esc / P)">${ICON_PAUSE}</button>
       <button type="button" class="cbv-btn cbv-icon-btn cbv-mute-btn" aria-label="Mute" title="Mute (M)"></button>
     </div>
 
     <div class="cbv-layer cbv-overlay cbv-pause">
       <section class="cbv-panel cbv-small-panel" aria-label="Paused">
-        <h2 class="cbv-panel-title">Paused</h2>
-        <p class="cbv-panel-sub">Take a breather in the shade.</p>
+        <h2 class="cbv-panel-title cbv-pause-title">Paused</h2>
+        <p class="cbv-panel-sub cbv-pause-sub">Take a breather in the shade.</p>
+        <p class="cbv-live-note cbv-on-only"><span class="cbv-live-dot"></span><span><b>Match continues&hellip;</b><small>Online games don't pause</small></span></p>
         <div class="cbv-btn-col">
           <button type="button" class="cbv-btn cbv-btn-big cbv-resume">Resume</button>
-          <button type="button" class="cbv-btn cbv-restart">Restart</button>
-          <button type="button" class="cbv-btn cbv-quit">Menu</button>
+          <button type="button" class="cbv-btn cbv-restart cbv-off-only">Restart</button>
+          <button type="button" class="cbv-btn cbv-quit cbv-off-only">Menu</button>
+          <button type="button" class="cbv-btn cbv-to-lobby cbv-on-only cbv-host-only">Back to lobby</button>
+          <button type="button" class="cbv-btn cbv-leave cbv-on-only">Leave room</button>
         </div>
       </section>
     </div>
@@ -258,8 +396,12 @@ export function createUI(rootEl, events, callbacks = {}) {
         </div>
         <p class="cbv-panel-sub cbv-over-sub"></p>
         <div class="cbv-btn-col">
-          <button type="button" class="cbv-btn cbv-btn-big cbv-again">Play again <kbd>Enter</kbd></button>
-          <button type="button" class="cbv-btn cbv-quit">Menu</button>
+          <button type="button" class="cbv-btn cbv-btn-big cbv-again cbv-off-only">Play again <kbd>Enter</kbd></button>
+          <button type="button" class="cbv-btn cbv-quit cbv-off-only">Menu</button>
+          <button type="button" class="cbv-btn cbv-btn-big cbv-rematch cbv-on-only cbv-host-only">Rematch! <kbd>Enter</kbd></button>
+          <button type="button" class="cbv-btn cbv-to-lobby cbv-on-only cbv-host-only">Back to lobby</button>
+          <div class="cbv-wait-host cbv-on-only cbv-guest-only"><span class="cbv-wait-ball">${BALL_SVG}</span><span>Waiting for the host<span class="cbv-dots"><i>.</i><i>.</i><i>.</i></span></span></div>
+          <button type="button" class="cbv-btn cbv-leave cbv-on-only cbv-guest-only">Leave room</button>
         </div>
       </section>
     </div>`;
@@ -285,7 +427,7 @@ export function createUI(rootEl, events, callbacks = {}) {
   const overLayer = q('.cbv-over');
   const pauseBtn = q('.cbv-pause-btn');
   const muteBtn = q('.cbv-mute-btn');
-  const diffBtns = qa('.cbv-diff-btn');
+  const diffBtns = qa('.cbv-menu-main .cbv-diff-btn');
   const startBtn = q('.cbv-start');
   const resumeBtn = q('.cbv-resume');
   const restartBtn = q('.cbv-restart');
@@ -303,6 +445,31 @@ export function createUI(rootEl, events, callbacks = {}) {
   const finalA = q('.cbv-final-a');
   const finalB = q('.cbv-final-b');
   const confetti = q('.cbv-confetti');
+  // online
+  const onlineBtn = q('.cbv-online-btn');
+  const nameInput = q('.cbv-name-input');
+  const codeInput = q('.cbv-code-input');
+  const codeErr = q('.cbv-code-err');
+  const createBtn = q('.cbv-create');
+  const joinBtn = q('.cbv-join');
+  const lobbyLayer = q('.cbv-lobby');
+  const codeEl = q('.cbv-code');
+  const copyBtn = q('.cbv-copy');
+  const copyText = q('.cbv-copy-text');
+  const lobbySub = q('.cbv-lobby-sub');
+  const lobbyBanner = q('.cbv-lobby-banner');
+  const slotBtns = qa('.cbv-slot');
+  const waitingEl = q('.cbv-waiting');
+  const lobbyDiffBtns = qa('.cbv-lobby-diff .cbv-diff-btn');
+  const lobbyStartBtn = q('.cbv-lobby-start');
+  const rematchBtn = q('.cbv-rematch');
+  const toastLayer = q('.cbv-toasts');
+  const netChip = q('.cbv-net');
+  const netText = q('.cbv-net-text');
+  const pauseTitle = q('.cbv-pause-title');
+  const pauseSub = q('.cbv-pause-sub');
+  const scoreYou = scoreTeams.map((el) => el.querySelector('.cbv-score-you'));
+  const tagEls = qa('.cbv-tag').map((el) => ({ el, name: el.querySelector('.cbv-tag-name'), text: null, on: false, x: null, y: null, w: 0, h: 0, rect: null }));
 
   q('.cbv-meter-sweet').style.cssText = `bottom:${SERVE_GREEN[0] * 100}%;height:${(SERVE_GREEN[1] - SERVE_GREEN[0]) * 100}%`;
 
@@ -353,9 +520,32 @@ export function createUI(rootEl, events, callbacks = {}) {
   }
   renderMute();
 
+  // ---------- online state (docs/NETWORK.md) ----------
+  let room = null; // the server's room object; null = offline
+  let menuView = 'main'; // offline main menu sub-view: 'main' | 'online' (name + create/join)
+  let pending = null; // 'create' | 'join' while waiting for the first room message
+  let pendingTimer = 0;
+  let netPaused = false; // online "pause": the overlay is open, the match keeps running
+  let lobbyDiff = 'normal';
+  let lobbyDiffRoom; // room.difficulty that lobbyDiff was last synced from
+  let netStatus = { status: 'offline', ping: null };
+  let me = { id: 0, team: 0 }; // this screen's player (refreshed every frame from state.controlledId)
+
+  /** My slot (player id) in room `r`, or null (waiting in the lobby). */
+  function mySlotOf(r) {
+    if (!r) return null;
+    const i = Array.isArray(r.slots) ? r.slots.indexOf(r.you) : -1;
+    if (i >= 0 && i < 4) return i;
+    const c = Array.isArray(r.clients) ? r.clients.find((x) => x && x.id === r.you) : null;
+    return c && Number.isInteger(c.slot) && c.slot >= 0 && c.slot < 4 ? c.slot : null;
+  }
+  const isOwner = () => !!room && room.owner != null && room.owner === room.you;
+  const isEditable = (t) => !!t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || !!t.isContentEditable);
+
   // ---------- actions ----------
   let lastState = null;
   function start() {
+    if (room || menuView !== 'main') return;
     if (lastState && lastState.phase !== 'menu') return;
     doc.activeElement?.blur?.();
     call('onStart', difficulty);
@@ -371,12 +561,325 @@ export function createUI(rootEl, events, callbacks = {}) {
     b.addEventListener('focus', () => selectDiff(b.dataset.diff));
   }
   onClick(startBtn, start);
-  onClick(pauseBtn, () => call('onPause'));
+  onClick(pauseBtn, () => (room ? openNetPause() : call('onPause')));
   onClick(muteBtn, toggleMute);
-  onClick(resumeBtn, () => call('onResume'));
+  onClick(resumeBtn, () => (room ? closeNetPause() : call('onResume')));
   onClick(restartBtn, () => call('onRestart'));
   onClick(againBtn, () => call('onRestart'));
   for (const b of qa('.cbv-quit')) onClick(b, () => call('onQuitToMenu'));
+
+  // ----- online: entry panel (name + create / join) -----
+  let savedName = '';
+  try { savedName = win.localStorage.getItem(NAME_STORAGE_KEY) || ''; } catch { /* ignore */ }
+  nameInput.value = savedName.slice(0, NAME_MAX);
+  try {
+    const qs = new win.URLSearchParams(win.location.search);
+    const c = normalizeCode(qs.get('room') || '');
+    if (c) codeInput.value = c;
+  } catch { /* ignore */ }
+
+  function cleanName() {
+    return nameInput.value.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, NAME_MAX);
+  }
+  function saveName(n) {
+    try { win.localStorage.setItem(NAME_STORAGE_KEY, n); } catch { /* ignore */ }
+  }
+  function renderMenuView() {
+    menuWrap.dataset.view = menuView;
+  }
+  function openOnline() {
+    if (room) return;
+    menuView = 'online';
+    renderMenuView();
+    validateCode(false);
+    call('onOnlineOpen');
+    focusSoon(nameInput.value ? (codeInput.value ? joinBtn : createBtn) : nameInput);
+  }
+  function closeOnline() {
+    menuView = 'main';
+    setPending(null);
+    renderMenuView();
+    call('onOnlineClose');
+    focusSoon(onlineBtn);
+  }
+  function validateCode(loud) {
+    const raw = codeInput.value;
+    const code = normalizeCode(raw);
+    if (raw !== code) codeInput.value = code;
+    const problem = codeProblem(code);
+    joinBtn.disabled = !!problem || !!pending;
+    let msg = 'Ask the host for the 4-letter code';
+    let bad = false;
+    if (code && problem && (loud || code.length === 4 || /[IO01]/.test(code))) { msg = problem; bad = true; }
+    else if (code && problem) msg = `${4 - code.length} more letter${code.length === 3 ? '' : 's'}...`;
+    else if (!problem) msg = 'Looks good!';
+    codeErr.textContent = msg;
+    codeErr.classList.toggle('is-err', bad);
+    codeErr.classList.toggle('is-ok', !problem);
+    codeInput.classList.toggle('is-err', bad);
+    return problem ? null : code;
+  }
+  function setPending(kind) {
+    pending = kind;
+    win.clearTimeout(pendingTimer);
+    if (kind) {
+      pendingTimer = win.setTimeout(() => {
+        if (pending && !room) toast("No answer from the server", 'Check your connection and try again');
+        setPending(null);
+      }, 10000);
+    }
+    createBtn.disabled = !!kind;
+    createBtn.textContent = kind === 'create' ? 'Creating...' : 'Create room';
+    joinBtn.textContent = kind === 'join' ? 'Joining...' : 'Join';
+    createBtn.classList.toggle('is-busy', kind === 'create');
+    joinBtn.classList.toggle('is-busy', kind === 'join');
+    validateCode(false);
+  }
+  function doCreate() {
+    if (pending || room) return;
+    const name = cleanName();
+    nameInput.value = name;
+    saveName(name);
+    setPending('create');
+    call('onOnlineCreate', name);
+  }
+  function doJoin() {
+    if (pending || room) return;
+    const code = validateCode(true);
+    if (!code) {
+      bump(codeInput, 'is-shake');
+      codeInput.focus({ preventScroll: true });
+      return;
+    }
+    const name = cleanName();
+    nameInput.value = name;
+    saveName(name);
+    setPending('join');
+    call('onOnlineJoin', code, name);
+  }
+  onClick(onlineBtn, openOnline);
+  onClick(q('.cbv-online-back'), closeOnline);
+  onClick(createBtn, doCreate);
+  onClick(joinBtn, doJoin);
+  codeInput.addEventListener('input', () => validateCode(false));
+  nameInput.addEventListener('change', () => saveName(cleanName()));
+  nameInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); if (normalizeCode(codeInput.value).length === 4) doJoin(); else doCreate(); }
+    else if (e.key === 'Escape') { e.preventDefault(); closeOnline(); }
+  });
+  codeInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); doJoin(); }
+    else if (e.key === 'Escape') { e.preventDefault(); closeOnline(); }
+  });
+
+  // ----- online: lobby -----
+  function selectLobbyDiff(d) {
+    if (!DIFFS.includes(d)) return;
+    lobbyDiff = d;
+    for (const b of lobbyDiffBtns) {
+      const on = b.dataset.diff === d;
+      b.classList.toggle('is-selected', on);
+      b.setAttribute('aria-checked', String(on));
+    }
+  }
+  selectLobbyDiff(lobbyDiff);
+  for (const b of lobbyDiffBtns) onClick(b, () => selectLobbyDiff(b.dataset.diff));
+  const humansIn = (r) => (r && Array.isArray(r.slots) ? r.slots.filter((x) => x != null).length : 0);
+  function lobbyStart() {
+    if (!room || !isOwner() || room.phase === 'playing') return;
+    if (!humansIn(room)) { toast('Nobody is playing yet', 'Take a spot first!', 'info'); return; }
+    call('onOnlineStart', lobbyDiff);
+  }
+  onClick(lobbyStartBtn, lobbyStart);
+  onClick(rematchBtn, () => { if (room && isOwner()) call('onOnlineStart', DIFFS.includes(room.difficulty) ? room.difficulty : lobbyDiff); });
+  for (const b of qa('.cbv-to-lobby')) onClick(b, () => { if (room && isOwner()) { netPaused = false; call('onOnlineToLobby'); } });
+  for (const b of qa('.cbv-leave')) onClick(b, () => { if (room) { netPaused = false; call('onOnlineLeave'); } });
+  for (const b of slotBtns) {
+    onClick(b, () => {
+      if (!room) return;
+      const i = Number(b.dataset.slot);
+      if (b.dataset.state === 'mine') call('onOnlineSlot', null);
+      else if (b.dataset.state === 'free') call('onOnlineSlot', i);
+      else bump(b, 'is-wiggle');
+    });
+  }
+  let copyTimer = 0;
+  async function copyCode() {
+    const code = room && room.code;
+    if (!code) return;
+    let ok = false;
+    try { await win.navigator.clipboard.writeText(code); ok = true; } catch { /* insecure context: fall back */ }
+    if (!ok) {
+      try {
+        const ta = doc.createElement('textarea');
+        ta.value = code;
+        ta.setAttribute('readonly', '');
+        ta.style.cssText = 'position:fixed;left:-999px;top:0;opacity:0';
+        root.appendChild(ta);
+        ta.select();
+        ok = doc.execCommand('copy');
+        ta.remove();
+      } catch { /* ignore */ }
+    }
+    copyText.textContent = ok ? 'Copied!' : 'Copy failed';
+    copyBtn.classList.toggle('is-done', ok);
+    bump(copyBtn, 'is-wiggle');
+    win.clearTimeout(copyTimer);
+    copyTimer = win.setTimeout(() => { copyText.textContent = 'Copy'; copyBtn.classList.remove('is-done'); }, 1600);
+  }
+  onClick(copyBtn, copyCode);
+
+  function renderRoom() {
+    root.classList.toggle('is-online', !!room);
+    root.classList.toggle('is-host', isOwner());
+    if (!room) return;
+    const code = String(room.code || '').slice(0, 8);
+    if (codeEl.dataset.code !== code) {
+      codeEl.dataset.code = code;
+      codeEl.innerHTML = [...code].map((ch, i) => `<span style="--i:${i}">${esc(ch)}</span>`).join('');
+      codeEl.setAttribute('aria-label', `Room code ${code.split('').join(' ')}`);
+    }
+    const clients = Array.isArray(room.clients) ? room.clients.filter(Boolean) : [];
+    const byId = new Map(clients.map((c) => [c.id, c]));
+    const slots = Array.isArray(room.slots) ? room.slots : [];
+    const mySlot = mySlotOf(room);
+    const playing = room.phase === 'playing';
+    slotBtns.forEach((b, i) => {
+      const cid = slots[i] ?? null;
+      const c = cid != null ? byId.get(cid) : null;
+      const mine = cid != null && cid === room.you;
+      const st = mine ? 'mine' : cid != null ? 'taken' : 'free';
+      const look = TEAMS[i < 2 ? 0 : 1].players[i % 2];
+      const name = c && c.name ? String(c.name).slice(0, 24) : 'Player';
+      b.dataset.state = st;
+      b.querySelector('.cbv-slot-who').innerHTML = cid != null
+        ? `<span class="cbv-slot-name">${esc(name)}</span>${cid === room.owner ? ICON_CROWN : ''}${mine ? '<span class="cbv-you-badge">You</span>' : ''}`
+        : '<span class="cbv-ai">AI</span>';
+      b.querySelector('.cbv-slot-act').textContent = mine ? 'Click to leave' : st === 'free' ? (mySlot === null ? 'Click to play' : 'Click to switch') : '';
+      b.setAttribute('aria-disabled', String(st === 'taken'));
+      b.setAttribute('aria-label', `${look.name}: ${cid != null ? name : 'AI'}${mine ? ' (you, click to leave)' : st === 'free' ? ' (free, click to take)' : ''}`);
+    });
+    const waiting = clients.filter((c) => !slots.includes(c.id));
+    waitingEl.innerHTML = waiting.length
+      ? `<span class="cbv-waiting-label">Watching:</span>${waiting.map((c) => `<span class="cbv-wait-chip${c.id === room.you ? ' is-me' : ''}">${esc(String(c.name || 'Player').slice(0, 24))}${c.id === room.owner ? ICON_CROWN : ''}${c.id === room.you ? ' <b>(you)</b>' : ''}</span>`).join('')}`
+      : '';
+    waitingEl.classList.toggle('is-empty', !waiting.length);
+    if (room.difficulty !== lobbyDiffRoom) {
+      lobbyDiffRoom = room.difficulty;
+      if (DIFFS.includes(room.difficulty)) selectLobbyDiff(room.difficulty);
+    }
+    const diffLabel = DIFF_INFO[room.difficulty]?.label ?? DIFF_INFO[lobbyDiff].label;
+    const meLine = mySlot !== null
+      ? `You're ${TEAMS[mySlot < 2 ? 0 : 1].players[mySlot % 2].name} on ${TEAMS[mySlot < 2 ? 0 : 1].name}`
+      : 'Pick a spot to play!';
+    lobbySub.textContent = isOwner() ? meLine : `${meLine} · AI: ${diffLabel}`;
+    let banner = '';
+    if (playing && mySlot === null) banner = 'Match in progress! Grab an AI spot and you jump in at the next point.';
+    else if (playing) banner = 'Starting the match...';
+    lobbyBanner.textContent = banner;
+    lobbyBanner.classList.toggle('is-on', !!banner);
+    lobbyLayer.classList.toggle('is-playing', playing);
+    const n = humansIn(room);
+    lobbyStartBtn.disabled = !n || playing;
+    lobbyStartBtn.title = n ? '' : 'Someone needs to take a spot first';
+  }
+
+  function setRoom(r) {
+    const prev = room;
+    room = r && typeof r === 'object' && typeof r.code === 'string' ? r : null;
+    if (room) {
+      if (pending) setPending(null);
+      if (prev && prev.owner !== room.owner && isOwner()) toast("You're the host now!", 'You can start matches and pick the AI level', 'info');
+      if (!prev || prev.code !== room.code) lobbyDiffRoom = undefined;
+      if (room.phase !== 'playing') netPaused = false;
+    } else if (prev) {
+      // left / disconnected: back to the online panel of the main menu
+      menuView = 'online';
+      netPaused = false;
+      renderMenuView();
+      setPending(null);
+      active = false; // offline popups are driven by matchStart / menu again
+      clearPopups();
+      hintUntil = 0;
+    }
+    renderRoom();
+  }
+
+  // ----- online: connection status chip + error toasts -----
+  function renderNet() {
+    const { status, ping } = netStatus;
+    netChip.dataset.status = status;
+    let text = 'Offline';
+    if (status === 'connecting') text = 'Connecting...';
+    else if (status === 'online') text = Number.isFinite(ping) ? `Online · ${Math.round(ping)} ms` : 'Online';
+    netText.textContent = text;
+    netChip.dataset.ping = status !== 'online' || !Number.isFinite(ping) ? '' : ping < 90 ? 'good' : ping < 180 ? 'ok' : 'bad';
+    netChip.title = netStatus.message ? `Connection: ${netStatus.message}` : 'Connection';
+  }
+  function setNetStatus(p) {
+    if (!p || typeof p !== 'object') return;
+    const st = p.status;
+    if (st === 'error') {
+      const code = errorCodeOf(p);
+      const [title, sub] = code ? ERROR_TEXT[code] : [String(p.message || p.msg || 'Connection problem').slice(0, 80), ''];
+      toast(title, sub, code === 'started' ? 'info' : 'error');
+      if (code === 'noRoom' || code === 'full') {
+        codeErr.textContent = title;
+        codeErr.classList.add('is-err');
+        bump(codeInput, 'is-shake');
+      }
+      setPending(null);
+      if (netStatus.status === 'connecting') { netStatus = { status: 'offline', ping: null, message: p.message }; renderNet(); }
+      return;
+    }
+    if (st !== 'connecting' && st !== 'online' && st !== 'offline') return;
+    const prevSt = netStatus.status;
+    const ping = Number.isFinite(p.ping) ? p.ping : st === 'online' ? netStatus.ping : null;
+    netStatus = { status: st, ping, message: typeof p.message === 'string' ? p.message : '' };
+    if (st === 'offline' && prevSt !== 'offline') {
+      if (prevSt === 'online' && (room || menuView === 'online')) toast('Disconnected', netStatus.message || 'Lost the connection to the server');
+      else if (prevSt === 'connecting' && pending) toast("Can't reach the server", netStatus.message || 'Is it running? Try again in a moment');
+      setPending(null);
+    }
+    renderNet();
+  }
+  renderNet();
+
+  const TOAST_MS = 3400;
+  function toast(title, sub = '', tone = 'error') {
+    for (const el of toastLayer.children) {
+      if (el.dataset.title === title && !el.classList.contains('is-out')) {
+        win.clearTimeout(Number(el.dataset.timer));
+        el.dataset.timer = String(win.setTimeout(() => dropToast(el), TOAST_MS));
+        bump(el, 'is-wiggle');
+        return;
+      }
+    }
+    const el = doc.createElement('div');
+    el.className = 'cbv-toast';
+    el.dataset.tone = tone;
+    el.dataset.title = title;
+    el.innerHTML = `<span class="cbv-toast-ico">${tone === 'error' ? '!' : 'i'}</span><span class="cbv-toast-body"><b>${esc(title)}</b>${sub ? `<span>${esc(sub)}</span>` : ''}</span>`;
+    toastLayer.appendChild(el);
+    while (toastLayer.children.length > 3) toastLayer.firstElementChild.remove();
+    el.dataset.timer = String(win.setTimeout(() => dropToast(el), TOAST_MS));
+  }
+  function dropToast(el) {
+    el.classList.add('is-out');
+    win.setTimeout(() => el.remove(), 320);
+  }
+
+  // ----- online pause: the overlay opens but the match keeps running -----
+  function openNetPause() {
+    if (netPaused) return;
+    netPaused = true;
+    call('onPause');
+  }
+  function closeNetPause() {
+    if (!netPaused) return;
+    netPaused = false;
+    call('onResume');
+  }
 
   // Space must never activate our buttons (it's the jump key). preventDefault only stops
   // the button activation; the event still propagates to the game's window listener.
@@ -386,8 +889,10 @@ export function createUI(rootEl, events, callbacks = {}) {
   root.addEventListener('keydown', blockSpace);
   root.addEventListener('keyup', blockSpace);
 
+  let ui = { lobby: false, inMatch: false }; // what update() last showed (for the key handler)
   win.addEventListener('keydown', (e) => {
     if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (isEditable(e.target)) return; // typing a name / code: no shortcuts (inputs handle Enter/Esc)
     const s = lastState;
     const phase = s ? s.phase : 'menu';
     const onOurButton = e.target instanceof win.HTMLElement && root.contains(e.target) && e.target.closest('button');
@@ -396,8 +901,35 @@ export function createUI(rootEl, events, callbacks = {}) {
       toggleMute();
       return;
     }
+    if (room) {
+      if (ui.lobby) {
+        if (e.key === 'Enter' && !e.repeat && !onOurButton && isOwner()) { e.preventDefault(); lobbyStart(); }
+        return;
+      }
+      if (!ui.inMatch) return;
+      const pauseKey = e.key === 'Escape' || e.key === 'Esc' || e.key === 'p' || e.key === 'P';
+      if (pauseKey && !e.repeat && phase !== 'matchOver') {
+        if (netPaused) closeNetPause(); else openNetPause();
+        return;
+      }
+      if (e.key === 'Enter' && !e.repeat && !onOurButton) {
+        if (phase === 'matchOver') { if (isOwner()) { e.preventDefault(); rematchBtn.click(); } }
+        else if (netPaused) { e.preventDefault(); closeNetPause(); }
+      }
+      return;
+    }
     if (phase === 'menu') {
-      if (e.key === 'Enter') { e.preventDefault(); if (!e.repeat) start(); return; }
+      if (menuView === 'online') {
+        if (e.key === 'Escape') { e.preventDefault(); closeOnline(); }
+        return;
+      }
+      if (e.key === 'Enter') {
+        // Enter starts the offline match, unless a non-difficulty button (Play Online, mute) is focused
+        if (onOurButton && !onOurButton.matches('.cbv-diff-btn, .cbv-start')) return;
+        e.preventDefault();
+        if (!e.repeat) start();
+        return;
+      }
       const i = DIFFS.indexOf(difficulty);
       if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); selectDiff(DIFFS[Math.max(0, i - 1)]); focusDiff(); }
       if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); selectDiff(DIFFS[Math.min(DIFFS.length - 1, i + 1)]); focusDiff(); }
@@ -501,23 +1033,26 @@ export function createUI(rootEl, events, callbacks = {}) {
   });
   on('serveReady', (p) => {
     if (!p) return;
-    if (p.isHuman) {
-      popup({ text: 'Your serve!', sub: 'Hold J, release to serve', team: 0, priority: 2, duration: 2200 });
+    // Offline the only human is Momo (id 0 = me.id). Online every human serves, so check it's MY serve.
+    if (p.isHuman && p.playerId === me.id) {
+      popup({ text: 'Your serve!', sub: 'Hold J, release to serve', team: p.team === 1 ? 1 : 0, priority: 2, duration: 2200 });
     } else if (p.team === 0 || p.team === 1) {
       // Say who serves so the player doesn't press J for a serve that isn't theirs. Kept small.
       const look = TEAMS[p.team].players[(p.playerId ?? 0) % 2];
-      const who = p.team === 0 ? (look ? look.name : shortName(0)) : shortName(1);
+      const pl = lastState && Array.isArray(lastState.players) ? lastState.players[p.playerId] : null;
+      const human = pl && pl.human && typeof pl.name === 'string' && pl.name ? pl.name.slice(0, 16) : null;
+      const who = human ?? (p.team === me.team ? (look ? look.name : shortName(p.team)) : shortName(p.team));
       popup({ text: `${who} serves`, team: p.team, priority: 1, duration: 1100, small: true });
     }
   });
   on('passAttempt', (p) => {
-    if (active && p && p.playerId === 0) pass.pending = { timing: p.timing, meter: p.meter };
+    if (active && p && p.playerId === me.id) pass.pending = { timing: p.timing, meter: p.meter };
   });
   on('swing', (p) => {
-    if (active && p && p.playerId === 0) spike.pending = { timing: p.timing, meter: p.meter };
+    if (active && p && p.playerId === me.id) spike.pending = { timing: p.timing, meter: p.meter };
   });
   on('hit', (p) => {
-    const item = hitPopup(p);
+    const item = hitPopup(p, me);
     if (item) popup(item);
   });
   on('point', (p) => {
@@ -533,6 +1068,7 @@ export function createUI(rootEl, events, callbacks = {}) {
   const cache = {
     score0: null, score1: null, serving: null, possession: undefined, touches: null,
     charge: undefined, sweet: null, risk: undefined, phase: null, paused: null,
+    online: undefined, lobby: undefined, mine: undefined,
   };
 
   // ---------- timing meters beside Momo: J SPIKE (right of the head), K PASS (left) ----------
@@ -583,6 +1119,7 @@ export function createUI(rootEl, events, callbacks = {}) {
       if (pip) obstacles.push([pip.x - 30 * s, pip.y - 10 * s, pip.x + 30 * s, pip.y + 88 * s, 2]);
       if (ball) { const br = 20 * s + 10; obstacles.push([ball.x - br, ball.y - br, ball.x + br, ball.y + br, 4]); }
       for (const o of meters) if (o !== api && o.on && o.rect) obstacles.push([...o.rect, 1.5]);
+      for (const tg of tagEls) if (tg.on && tg.rect) obstacles.push([...tg.rect, 1]); // other humans' name tags
       for (const r of hudRects) obstacles.push([...r, 1.5]);
       let best = null;
       for (const sd of [side, side === 'right' ? 'left' : 'right']) {
@@ -715,8 +1252,8 @@ export function createUI(rootEl, events, callbacks = {}) {
   function updateSpike(state, view, t) {
     // Ball-synced: shown whenever state.spikeMeter is a number (undefined before the game side lands).
     const sm = typeof state.spikeMeter === 'number' ? Math.max(0, Math.min(1, state.spikeMeter)) : null;
-    const momo = Array.isArray(state.players) ? state.players[0] : null;
-    const grounded = momo ? momo.grounded !== false : true;
+    const mine = Array.isArray(state.players) && me.id !== null ? state.players[me.id] : null;
+    const grounded = mine ? mine.grounded !== false : true;
     setSpikeHeld(typeof state.hitCharge === 'number'); // wind-up: J glyph pressed (no second needle)
     if (spike.pending) {
       // A 'swing' arrived since the last frame: flash the game's verdict.
@@ -785,38 +1322,131 @@ export function createUI(rootEl, events, callbacks = {}) {
     pass.pending = null;
   }
 
+  // ---------- name tags above the OTHER human players (online) ----------
+  function roomNameFor(i) {
+    if (!room || !Array.isArray(room.slots) || !Array.isArray(room.clients)) return null;
+    const cid = room.slots[i];
+    const c = cid != null ? room.clients.find((x) => x && x.id === cid) : null;
+    return c && c.name ? String(c.name) : null;
+  }
+  function updateTags(state, view, on) {
+    const screens = view && Array.isArray(view.playerScreens) ? view.playerScreens : null;
+    const W = win.innerWidth || 800;
+    const H = win.innerHeight || 600;
+    const sc = Math.max(0.7, Math.min(1.3, H / 720));
+    const meterRects = [];
+    for (const m of meters) if (m.on && m.rect) meterRects.push(m.rect);
+    for (let i = 0; i < 4; i++) {
+      const tg = tagEls[i];
+      const p = on && screens && Array.isArray(state.players) ? state.players[i] : null;
+      const at = screens ? screens[i] : null;
+      if (!(p && p.human && i !== me.id && at && Number.isFinite(at.x) && Number.isFinite(at.y))) {
+        if (tg.on) { tg.on = false; tg.rect = null; tg.el.classList.remove('is-on'); }
+        continue;
+      }
+      const team = p.team === 1 ? 1 : p.team === 0 ? 0 : i < 2 ? 0 : 1;
+      const raw = (typeof p.name === 'string' && p.name.trim()) || roomNameFor(i) || TEAMS[team].players[i % 2].name;
+      const text = String(raw).trim().slice(0, 16);
+      if (text !== tg.text) { tg.text = text; tg.name.textContent = text; tg.w = 0; }
+      if (tg.el.dataset.team !== String(team)) tg.el.dataset.team = String(team);
+      if (!tg.on) { tg.on = true; tg.el.classList.add('is-on'); tg.w = 0; }
+      if (!tg.w) { tg.w = tg.el.offsetWidth || 60; tg.h = tg.el.offsetHeight || 22; }
+      let x = at.x - tg.w / 2;
+      let y = at.y - tg.h - 8 * sc;
+      const y0 = y;
+      // never cover my timing meters: hop above (or below) a meter it would overlap
+      for (const r of meterRects) {
+        if (x < r[2] + 4 && x + tg.w > r[0] - 4 && y < r[3] + 4 && y + tg.h > r[1] - 4) {
+          const up = r[1] - tg.h - 6;
+          y = up >= EDGE ? up : r[3] + 6;
+        }
+      }
+      x = clampN(x, EDGE, W - EDGE - tg.w);
+      y = clampN(y, EDGE, H - EDGE - tg.h);
+      tg.rect = [x, y, x + tg.w, y + tg.h];
+      const moved = Math.abs(y - y0) > 2;
+      if (moved !== tg.moved) { tg.moved = moved; tg.el.classList.toggle('is-moved', moved); }
+      const rx = Math.round(x);
+      const ry = Math.round(y);
+      if (rx !== tg.x || ry !== tg.y) {
+        tg.x = rx;
+        tg.y = ry;
+        tg.el.style.transform = `translate3d(${rx}px, ${ry}px, 0)`;
+      }
+    }
+  }
+
   function update(state, view) {
     if (!state) return;
     lastState = state;
     const t = now();
     const phase = state.phase;
-    const inMatch = phase === 'serve' || phase === 'rally' || phase === 'point' || phase === 'matchOver';
-    const isPaused = !!state.paused && inMatch && phase !== 'matchOver';
+    const online = !!room;
+    const mySlot = online ? mySlotOf(room) : null;
+    const matchPhase = phase === 'serve' || phase === 'rally' || phase === 'point' || phase === 'matchOver';
+    const roomPlaying = online && room.phase === 'playing';
+    // Online the HUD belongs to a running room match; the lobby shows otherwise, and over the match for
+    // clients without a slot (joined mid-match: they can grab an AI spot at the next point).
+    const inMatch = matchPhase && (!online || roomPlaying);
+    const lobbyOn = online && (!roomPlaying || mySlot === null || !matchPhase);
 
-    // Freeze popup timers while paused.
-    if (isPaused && current) current.start += t - lastTick;
-    if (isPaused && hintUntil) hintUntil += t - lastTick;
+    // This screen's player: state.controlledId (0 = Momo offline; online = my slot, null without one).
+    const cid = state.controlledId;
+    const validId = Number.isInteger(cid) && cid >= 0 && cid < 4;
+    const ctl = online ? (mySlot === null ? null : validId ? cid : mySlot) : validId ? cid : 0;
+    const mp = ctl !== null && Array.isArray(state.players) ? state.players[ctl] : null;
+    const team = ctl === null ? null : mp && (mp.team === 0 || mp.team === 1) ? mp.team : ctl < 2 ? 0 : 1;
+    if (me.id !== ctl || me.team !== team) me = { id: ctl, team };
+    setAudioPerspective({ team: team ?? 0, live: online && inMatch && phase !== 'matchOver' });
+    if (online && active !== inMatch) {
+      // online there may be no matchStart/menu event for us (joined mid-match, back to lobby)
+      active = inMatch;
+      if (!active) { clearPopups(); hintUntil = 0; }
+    }
+
+    // Offline pause freezes the sim; online "pause" only opens the overlay (the match keeps running).
+    const offPaused = !online && !!state.paused && inMatch && phase !== 'matchOver';
+    if (netPaused && (!online || !inMatch || phase === 'matchOver' || lobbyOn)) netPaused = false;
+    const isPaused = online ? netPaused : offPaused;
+
+    // Freeze popup timers while paused (offline only).
+    if (offPaused && current) current.start += t - lastTick;
+    if (offPaused && hintUntil) hintUntil += t - lastTick;
     lastTick = t;
 
-    show(menuWrap, phase === 'menu');
+    const menuOn = !online && phase === 'menu';
+    show(menuWrap, menuOn);
+    show(lobbyLayer, lobbyOn);
     show(hud, inMatch);
-    show(pauseBtn, inMatch && phase !== 'matchOver' && !isPaused);
+    show(pauseBtn, inMatch && phase !== 'matchOver' && !isPaused && !lobbyOn);
     show(pauseLayer, isPaused);
-    show(overLayer, phase === 'matchOver');
-    if (isPaused !== paused) {
-      paused = isPaused;
+    show(overLayer, inMatch && phase === 'matchOver' && !lobbyOn);
+    show(netChip, online || (menuOn && menuView === 'online'));
+    ui = { lobby: lobbyOn, inMatch: inMatch && !lobbyOn };
+    if (offPaused !== paused) {
+      paused = offPaused;
       root.classList.toggle('is-paused', paused);
+    }
+    if (online !== cache.online) {
+      cache.online = online;
+      pauseTitle.textContent = online ? 'Menu' : 'Paused';
+      resumeBtn.textContent = online ? 'Back to the game' : 'Resume';
+    }
+    if (lobbyOn !== cache.lobby) {
+      cache.lobby = lobbyOn;
+      if (lobbyOn && isOwner() && !roomPlaying) focusSoon(lobbyStartBtn);
+      else if (!lobbyOn && lobbyLayer.contains(doc.activeElement)) doc.activeElement.blur();
     }
 
     if (phase !== cache.phase) {
       const prev = cache.phase;
       cache.phase = phase;
       if (phase === 'menu') {
-        if (prev && prev !== 'menu') focusSoon(diffBtns.find((b) => b.dataset.diff === difficulty));
+        if (!online && prev && prev !== 'menu') focusSoon(diffBtns.find((b) => b.dataset.diff === difficulty));
       } else if (prev === 'menu' || prev === null) {
         doc.activeElement?.blur?.();
       }
-      if (phase === 'matchOver') showGameOver(state);
+      if (phase === 'matchOver' && inMatch) showGameOver(state);
       if (phase === 'rally' && !hintShown && active) {
         hintShown = true;
         hintUntil = t + HINT_MS;
@@ -835,6 +1465,13 @@ export function createUI(rootEl, events, callbacks = {}) {
       if (state.servingTeam !== cache.serving) {
         cache.serving = state.servingTeam;
         scoreTeams.forEach((el, i) => el.classList.toggle('is-serving', i === state.servingTeam));
+      }
+      // Online: mark which team is mine (offline keeps the plain "Peach - Mint").
+      const mine = online ? team : null;
+      if (mine !== cache.mine) {
+        cache.mine = mine;
+        scoreTeams.forEach((el, i) => el.classList.toggle('is-mine', i === mine));
+        scoreYou.forEach((el, i) => el.classList.toggle('is-on', i === mine));
       }
 
       const pt = state.possessionTeam === 0 || state.possessionTeam === 1 ? state.possessionTeam : null;
@@ -855,7 +1492,7 @@ export function createUI(rootEl, events, callbacks = {}) {
         if (grew && tc > 0) bump(dots[tc - 1], 'is-pop');
       }
 
-      const ch = typeof state.serveCharge === 'number' ? Math.max(0, Math.min(1, state.serveCharge)) : null;
+      const ch = ctl !== null && typeof state.serveCharge === 'number' ? Math.max(0, Math.min(1, state.serveCharge)) : null;
       if (ch !== cache.charge) {
         cache.charge = ch;
         meter.classList.toggle('is-on', ch !== null);
@@ -882,33 +1519,37 @@ export function createUI(rootEl, events, callbacks = {}) {
       cache.possession = undefined;
       cache.charge = undefined;
       cache.risk = undefined;
+      cache.mine = undefined;
     }
 
     const bigPopup = !!current && current.item.priority >= 3;
-    const hintOn = hintUntil > t && inMatch && phase !== 'matchOver' && !bigPopup;
+    const hintOn = hintUntil > t && inMatch && phase !== 'matchOver' && !bigPopup && !lobbyOn;
     if (!hintOn && hintUntil && hintUntil <= t) hintUntil = 0;
     show(hint, hintOn);
 
-    if (inMatch && phase !== 'matchOver' && !isPaused) {
+    if (inMatch && phase !== 'matchOver' && !offPaused && ctl !== null) {
       updateSpike(state, view, t);
       updatePass(state, view, t);
-    } else if (!isPaused && (spikeMeter.on || passMeter.on)) {
+    } else if (!offPaused && (spikeMeter.on || passMeter.on)) {
       hideMeters();
     }
+    updateTags(state, view, inMatch && phase !== 'matchOver');
 
-    if (!isPaused) pumpPopups();
+    if (!offPaused) pumpPopups();
   }
 
   function showGameOver(state) {
     const score = state.score || [0, 0];
     const winner = matchWinner ?? (score[0] >= score[1] ? 0 : 1);
     matchWinner = null;
-    const won = winner === 0;
+    const myT = me.team === 1 ? 1 : 0;
+    const won = winner === myT;
     clearPopups();
     hintUntil = 0;
     overLayer.classList.toggle('is-win', won);
     overTitle.innerHTML = won ? `You win! ${PARTY_SVG}` : 'So close!';
-    overSub.textContent = won ? `${TEAMS[0].name} rules the beach!` : `${TEAMS[1].name} takes this one. Rematch?`;
+    const again = room ? (isOwner() ? ' Rematch?' : '') : ' Rematch?';
+    overSub.textContent = won ? `${TEAMS[myT].name} rules the beach!` : `${TEAMS[1 - myT].name} takes this one.${again}`;
     finalA.textContent = score[0];
     finalB.textContent = score[1];
     confetti.replaceChildren();
@@ -922,8 +1563,17 @@ export function createUI(rootEl, events, callbacks = {}) {
         confetti.appendChild(c);
       }
     }
-    focusSoon(againBtn);
+    if (!room) focusSoon(againBtn);
+    else if (isOwner()) focusSoon(rematchBtn);
   }
 
-  return { update };
+  const api = {
+    update,
+    setRoom,
+    setNetStatus,
+    /** Show an error toast directly: a NETWORK.md error code ('noRoom', 'full', ...) or a message. */
+    showError(codeOrMsg) { setNetStatus({ status: 'error', message: String(codeOrMsg ?? '') }); },
+  };
+  try { win.__volleyUI = api; } catch { /* debug/test hook only */ }
+  return api;
 }

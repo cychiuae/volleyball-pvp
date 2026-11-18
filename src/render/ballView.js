@@ -153,9 +153,11 @@ export function createBallView(scene) {
     marker.position.set(markerPos.x, 0.03, markerPos.z);
     marker.rotation.y = clock * 1.2;
 
-    // --- aim reticle (human attack aim)
+    // --- aim reticle (local human's attack aim; tinted with the local player's team colour)
     const at = fullState && fullState.aimTarget;
     if (at) {
+      const me = Number.isInteger(fullState.controlledId) && fullState.players ? fullState.players[fullState.controlledId] : null;
+      aimMat.color.copy(teamColors[me && me.team === 1 ? 1 : 0]);
       if (aimAlpha <= 0.01) aimPos.copy(at);
       aimPos.lerp(at, 1 - Math.exp(-18 * dt));
       aimAlpha = Math.min(1, aimAlpha + dt * 7);

@@ -1,7 +1,7 @@
 # Cute Beach Volley — Architecture Contract
 
-Single-player 3D 2v2 beach volleyball in the browser. You (Team Peach, 2 players, near the camera)
-vs CPU (Team Mint, far side). Style: cute, chibi, pastel, toon-shaded, sunny beach.
+3D 2v2 beach volleyball in the browser. Offline: you (Momo, Team Peach, near the camera) + AI partner
+vs CPU (Team Mint, far side). Online: up to 4 humans, AI fills empty slots — see **docs/NETWORK.md**. Style: cute, chibi, pastel, toon-shaded, sunny beach.
 
 Stack: Vite + Three.js r170 (`import * as THREE from 'three'`), plain ES modules, no frameworks.
 No external asset files: all geometry, textures (CanvasTexture), sounds (WebAudio) are procedural.
@@ -25,6 +25,7 @@ another owner's module; if a contract must change, say so in your final report.
 | `src/render/*` | environment-artist | `createStage`, `createCourt`, `createBallView`, `createEffects` |
 | `src/characters/*` | character-artist | `createCharacter` |
 | `src/ui/*`, `src/audio/*` | ui-audio-designer | `createUI`, `createAudio` |
+| `server/*`, `src/net/*`, `tests/net*.test.js` | network-engineer | `createNetClient`, the Node server |
 
 ## Game state (read-only for everyone except src/game)
 `game.state` is a live object mutated in place by the simulation; views read it every frame.
@@ -41,7 +42,8 @@ state = {
   serverId: number,             // index into players
   touches: number,              // touches by the team currently in possession (0..3)
   possessionTeam: 0 | 1 | null, // team whose side the ball is on / last touched
-  controlledId: 0,              // the human ALWAYS controls player 0 (Momo); never switches
+  controlledId: number,         // the player THIS SCREEN controls: 0 (Momo) offline; online = my slot (client sets it)
+                                //   The top-level meter fields below MIRROR players[controlledId].meters.
   serveRisk: number | null,     // 0..1 risk of a long serve from holding at full charge past the grace period (null when not charging)
   serveCharge: number | null,   // 0..1 while the human holds the serve button, else null
   passMeter: number | null,     // 0..1 pass/set timing meter while a ball is incoming to Momo (fill = 1 - timeToContact/METER.pass.leadSec); null otherwise
@@ -71,7 +73,14 @@ state = {
       grounded: boolean,
       action: null | 'bump' | 'set' | 'spike' | 'serveToss' | 'serveHit' | 'block' | 'dive' | 'celebrate' | 'sad',
       actionTime: number,       // seconds since `action` started (reset to 0 on each new action)
-      controlled: boolean,      // true only for player 0 (the human)
+      controlled: boolean,      // true only for players[controlledId] (this screen's player)
+      human: boolean,           // controlled by any human (local or remote); false = AI
+      name?: string,            // online only: the human's display name (set by the net client)
+      meters: {                 // per-player timing meters (same meaning as the top-level fields)
+        pass, spike, hitCharge, serveCharge, serveRisk,   // number | null
+        passWindow, hitWindow,  // seconds, 0 = closed
+        aimTarget,              // Vector3 | null
+      },
       windup?: number | null,   // VIEW-ONLY, written by main.js for player 0 = state.hitCharge (spike wind-up pose)
     },
   ],
@@ -80,7 +89,9 @@ state = {
 
 Game API (`src/game/game.js`):
 ```js
-const game = createGame({ events, input });
+const game = createGame({ events, input });          // offline: input drives player 0, others AI
+const game = createGame({ events, inputs, allowPause: false }); // online server: inputs[4], null = AI slot
+game.setInputs(inputs);                              // change human/AI slots at any time
 game.state;                         // as above; phase 'menu' until startMatch
 game.startMatch({ difficulty });    // resets score, phase -> 'serve'
 game.update(dt);                    // advance; must be a no-op for sim while paused or in 'menu'
@@ -89,6 +100,11 @@ game.pause(); game.resume(); game.toMenu();
 ```
 Input (`src/game/input.js`): `createInput(window)` → object the game polls each update
 (keyboard; gamepad optional). The game owns the meaning of keys.
+Input interface: `poll(), held(a), pressed(a), released(a), axis(), dispose()`, plus OPTIONAL
+`edgeTime(a)` → the `state.time` at which the latest edge of action `a` happened from the player's
+point of view (remote inputs only; absent/undefined = now). The game uses it for lag compensation
+(docs/NETWORK.md). Movement is screen-relative from the player's own side: "up" = toward the net
+for both teams (team 1 humans see the court from the -z side).
 
 ### Controls (UI shows these on the menu)
 The human controls exactly ONE player: Momo (players[0]). The partner Pip is fully AI-controlled
@@ -119,6 +135,7 @@ Three action buttons, nothing is automatic for Momo except blocking:
 ## Render APIs (`src/render/*`)
 ```js
 const stage = createStage(containerEl);   // { renderer, scene, camera, updateCamera(dt, state), render() }
+                                          // camera views from the side of players[state.controlledId].team (team 1 = mirrored, from -z)
                                           // owns resize handling, lights, shadows, sky/fog
 const court = createCourt(scene);         // { update(dt, elapsed, state) } — state optional (footprints) sand, lines, net, posts, beach decor
 const ballView = createBallView(scene);   // { update(dt, state.ball, state) } — state optional, for the aim reticle ball mesh, blob shadow, landing marker
@@ -134,8 +151,13 @@ UI (`src/ui/ui.js`) — DOM overlay inside `#ui` (pointer-events: none on root; 
 ```js
 const ui = createUI(rootEl, events, { onStart(difficulty), onPause(), onResume(), onRestart(),
                                       onQuitToMenu(), onToggleMute() /* returns muted bool */ });
-ui.update(state, view);   // every frame; view = { momoScreen, pipScreen, ballScreen }: {x, y} | null in CSS px
-                          // (momo/pip = just above the head, ball = ball centre) for placing HUD elements
+ui.update(state, view);   // every frame; view = { momoScreen, pipScreen, ballScreen, playerScreens }: {x, y} | null in CSS px
+                          // momoScreen = LOCAL player's head (players[controlledId]), pipScreen = local partner's head
+                          // (names kept for compatibility), ballScreen = ball centre, playerScreens[4] = every head (name tags)
+// Online additions (docs/NETWORK.md):
+//   callbacks.onOnline{Create(name), Join(code, name), Slot(slot|null), Start(difficulty), ToLobby(), Leave()}
+//   ui.setRoom(room | null)            // lobby / in-room state; null = offline
+//   ui.setNetStatus({ status, ping, message })
 ```
 Audio (`src/audio/audio.js`) — WebAudio synthesized, no files:
 ```js

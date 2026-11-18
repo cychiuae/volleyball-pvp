@@ -101,3 +101,13 @@ export const METER = {
   // fill = 1 - timeToContact / leadSec (1.0 = contact moment). Press K once while in green.
   pass:  { leadSec: 0.8, green: [0.75, 0.925] },     // green ≈ 0.20 s .. 0.06 s before contact
 };
+
+// Online multiplayer (see docs/NETWORK.md).
+export const NET = {
+  wsPath: '/ws',
+  defaultPort: 8787,
+  snapshotHz: 30,       // server → client state snapshots per second
+  interpDelay: 0.1,     // s; clients render this far behind the newest snapshot
+  maxRewind: 0.25,      // s; lag compensation never rewinds further than this (0.35 would suit RTT 200 ms but needs gameplay retuning; must stay < game POS_HISTORY 0.4 s)
+  maxPlayers: 4,
+};

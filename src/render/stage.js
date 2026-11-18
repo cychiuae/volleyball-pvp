@@ -1,6 +1,11 @@
 // Renderer, scene, camera rig, lights, sky and fog.
 // createStage(containerEl) -> { renderer, scene, camera, updateCamera(dt, state), render(),
-//                               setQuality('high'|'low'), quality }
+//                               setQuality('high'|'low'), quality, viewYaw, localTeam }
+// The camera views the court from the side of the LOCAL player's team
+// (players[state.controlledId].team): team 0 from +z, team 1 rotated 180 deg about y (from -z).
+// The whole rig (gameplay framing, serve view, rally follow, point push-in, menu/result orbits)
+// is computed in a canonical "team 0" local frame and rotated by viewYaw at the end; viewYaw
+// springs smoothly between 0 and PI when the local team changes, so there is never a pop.
 // 'high' renders through a post chain (MSAA HDR target -> soft bloom -> warm grade/vignette ->
 // OutputPass); 'low' is a plain direct render. Default 'high' with auto-downgrade when slow;
 // ?quality=low|high in the URL forces a level and disables the auto switch.
@@ -19,8 +24,11 @@ const BLOOM = { strength: 0.32, radius: 0.45, threshold: 1.18, smoothWidth: 0.3 
 const SLOW_FRAME_MS = 22;     // auto-downgrade when the average frame time stays above this
 const SLOW_WINDOW_MS = 3000;  // ...over this much play time
 
-// Sun comes from behind the human team (camera side) and a little to the left, high in the sky:
-// it lights the CPU team's faces and throws shadows away from the camera so they read on the sand.
+// Sun comes from behind the LOCAL team (camera side) and a little to the left, high in the sky:
+// it lights the opponents' faces and throws shadows away from the camera so they read on the sand.
+// SUN_DIR is the team-0 direction; the light (and the sky's sun disc) rotate with viewYaw so a
+// team-1 view gets the same readable front lighting instead of a backlit, face-in-shadow court.
+// Per-client cosmetic only; scene.userData.viewYaw is published for other render modules.
 export const SUN_DIR = new THREE.Vector3(-0.45, 1.0, 0.62).normalize();
 
 const BASE_FOV = 45;
@@ -38,6 +46,15 @@ const KEY_POINTS = [
   [-HW, 0, HL], [HW, 0, HL], [0, 0, COURT.halfLength + 1.2],
   [-HW, 1.4, HL - 1], [HW, 1.4, HL - 1],
 ].map(([x, y, z]) => new THREE.Vector3(x, y, z));
+
+const VIEW_SPRING = 2.2; // rad/s natural frequency of the team-side swing (~2 s, critically damped)
+
+/** Team whose side the local camera sits on (offline controlledId is 0 -> team 0). */
+export function localTeamOf(state) {
+  const id = state && Number.isInteger(state.controlledId) ? state.controlledId : 0;
+  const p = state && state.players && state.players[id];
+  return p && p.team === 1 ? 1 : 0;
+}
 
 const smooth = (a, b, x) => { const t = THREE.MathUtils.clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
 const damp = (rate, dt) => 1 - Math.exp(-rate * dt);
@@ -77,7 +94,8 @@ export function createStage(containerEl) {
   sun.target.position.set(0, 0, 0);
   sun.position.copy(SUN_DIR).multiplyScalar(40);
   scene.add(sun, sun.target);
-  fitShadowFrustum(sun, new THREE.Box3(new THREE.Vector3(-7.5, 0, -12), new THREE.Vector3(7.5, 4.5, 12)));
+  const shadowBox = new THREE.Box3(new THREE.Vector3(-7.5, 0, -12), new THREE.Vector3(7.5, 4.5, 12));
+  fitShadowFrustum(sun, shadowBox);
 
   // ---------------------------------------------------------------- sky dome
   const skyMat = new THREE.ShaderMaterial({
@@ -195,6 +213,42 @@ export function createStage(containerEl) {
   let shakeTime = 0;
   let clock = 0;
   let fitDist = 20;
+  // Team-side view rotation (radians about +y). Rig state (curPos/curLook) lives in the local frame.
+  let viewYaw = 0, yawVel = 0, localTeam = 0, sunYaw = 0;
+  let sunFollowsView = true;
+  const UP = new THREE.Vector3(0, 1, 0);
+  const sunDir = SUN_DIR.clone();
+  scene.userData.viewYaw = 0;
+
+  function applySun(yaw) {
+    sunYaw = yaw;
+    sunDir.copy(SUN_DIR).applyAxisAngle(UP, yaw);
+    sun.position.copy(sunDir).multiplyScalar(40);
+    sun.updateMatrixWorld();
+    skyMat.uniforms.uSunDir.value.copy(sunDir);
+    fitShadowFrustum(sun, shadowBox);
+  }
+  function stepViewYaw(dt, state) {
+    if (state && state.players) localTeam = localTeamOf(state);
+    const target = localTeam === 1 ? Math.PI : 0;
+    // Critically damped spring: starts and ends gently, never overshoots.
+    const w = VIEW_SPRING;
+    const sub = Math.max(1, Math.ceil(dt / 0.02));
+    const h = dt / sub;
+    for (let i = 0; i < sub; i++) {
+      yawVel += (w * w * (target - viewYaw) - 2 * w * yawVel) * h;
+      viewYaw += yawVel * h;
+    }
+    if (Math.abs(target - viewYaw) < 1e-4 && Math.abs(yawVel) < 1e-4) { viewYaw = target; yawVel = 0; }
+    scene.userData.viewYaw = viewYaw;
+    const sy = sunFollowsView ? viewYaw : 0;
+    if (Math.abs(sy - sunYaw) > 1e-5) applySun(sy);
+  }
+  // World <-> local (team-0 canonical) frame.
+  const toLocal = (v) => v.applyAxisAngle(UP, -viewYaw);
+  const toWorld = (v) => v.applyAxisAngle(UP, viewYaw);
+  const localBall = { pos: new THREE.Vector3(), visible: false };
+  const localState = { ball: localBall };
 
   const offsetDir = new THREE.Vector3(0, Math.sin(GAME_ELEVATION), Math.cos(GAME_ELEVATION));
 
@@ -244,6 +298,13 @@ export function createStage(containerEl) {
   function updateCamera(dt, state) {
     dt = Math.min(dt || 0, 0.1);
     clock += dt;
+    stepViewYaw(dt, state);
+    let ls = null;
+    if (state && state.ball && state.ball.pos) {
+      localBall.visible = state.ball.visible;
+      toLocal(localBall.pos.copy(state.ball.pos));
+      ls = localState;
+    }
     const phase = (state && state.phase) || 'menu';
     if (phase !== lastPhase) {
       if (lastPhase !== null) transition = phase === 'point' ? 0 : 1.4;
@@ -271,10 +332,10 @@ export function createStage(containerEl) {
       desLook.set(0, 1.4, 0);
       rate = 1.2;
     } else {
-      gameplayView(state, desPos, desLook);
-      if (phase === 'point' && state && state.ball) {
+      gameplayView(ls, desPos, desLook);
+      if (phase === 'point' && ls) {
         // Gentle push-in toward where the rally ended, then ease back before the next serve.
-        focus.copy(state.ball.pos);
+        focus.copy(localBall.pos);
         focus.y = THREE.MathUtils.clamp(focus.y, 0.3, 2.5);
         const w = smooth(0.1, 0.9, phaseTime) * (1 - smooth(1.4, 2.2, phaseTime));
         desLook.lerp(focus, 0.45 * w);
@@ -304,7 +365,7 @@ export function createStage(containerEl) {
     shake *= Math.exp(-5.5 * dt);
     if (shake < 0.002) shake = 0;
 
-    camera.position.copy(curPos);
+    toWorld(camera.position.copy(curPos));
     if (shake > 0) {
       const a = 0.16 * shake;
       camera.position.x += a * Math.sin(shakeTime * 47.0) * 0.9;
@@ -312,7 +373,7 @@ export function createStage(containerEl) {
       camera.position.z += a * Math.sin(shakeTime * 41.0 + 2.1) * 0.4;
     }
     camera.position.y = Math.max(camera.position.y, 0.8);
-    camera.lookAt(curLook);
+    camera.lookAt(toWorld(tmpV.copy(curLook)));
   }
 
   // ---------------------------------------------------------------- post / quality
@@ -443,6 +504,12 @@ export function createStage(containerEl) {
   return {
     renderer, scene, camera, updateCamera, render, setQuality, sun, hemi, stats,
     get quality() { return quality; },
+    /** Current team-side view rotation about +y (0 = team 0 view, PI = team 1 view). */
+    get viewYaw() { return viewYaw; },
+    get localTeam() { return localTeam; },
+    /** Debug: false keeps the sun fixed in world space (team-0 lighting) for every view. */
+    get sunFollowsView() { return sunFollowsView; },
+    set sunFollowsView(v) { sunFollowsView = !!v; },
     get fitDistance() { return fitDist; },
   };
 }

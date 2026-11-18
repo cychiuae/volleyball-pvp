@@ -210,7 +210,9 @@ export function createEffects(scene, events) {
     ringCursor = (ringCursor + 1) % rings.length;
     const { x, y, z } = P(pos);
     r.mesh.position.set(x, horizontal ? 0.04 : y, z);
-    r.mesh.rotation.set(horizontal ? -Math.PI / 2 : -0.25, 0, 0);
+    // Vertical rings lean back toward the local camera, whichever side it is on (stage publishes
+    // scene.userData.viewYaw: 0 = team-0 view from +z, PI = team-1 view from -z).
+    r.mesh.rotation.set(horizontal ? -Math.PI / 2 : -0.25, horizontal ? 0 : scene.userData.viewYaw || 0, 0, 'YXZ');
     r.mesh.material.color.set(color).multiplyScalar(1 + 0.6 * getGlowLevel());
     r.age = 0; r.life = life; r.size = size; r.active = true;
     r.mesh.visible = true;
@@ -220,7 +222,8 @@ export function createEffects(scene, events) {
     const w = walls[wallCursor];
     wallCursor = (wallCursor + 1) % walls.length;
     const { x, y } = P(pos);
-    w.mesh.position.set(x, Math.max(COURT.netHeight + 0.3, y), 0.05);
+    // A hair in front of the net on the local camera's side.
+    w.mesh.position.set(x, Math.max(COURT.netHeight + 0.3, y), 0.05 * Math.cos(scene.userData.viewYaw || 0));
     w.mesh.material.color.set(color).multiplyScalar(1 + 1.5 * getGlowLevel()); // additive is weaker in linear
     w.age = 0; w.active = true; w.mesh.visible = true;
   }

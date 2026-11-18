@@ -49,6 +49,16 @@ export function playCue(name) {
   for (const fn of cueSinks) fn(name);
 }
 
+// Listener perspective, set by the UI every frame (online the local player may be on Team Mint, and a
+// client that joins mid-match never sees 'matchStart'). team = this screen's team (0 offline);
+// live = true forces game events audible (online, in a running match). Offline nobody calls it with
+// anything but { team: 0, live: false }, so offline sound is unchanged.
+const perspective = { team: 0, live: false };
+export function setAudioPerspective({ team = 0, live = false } = {}) {
+  perspective.team = team === 1 ? 1 : 0;
+  perspective.live = !!live;
+}
+
 export function createAudio(events) {
   let ctx = null;
   let master = null;
@@ -208,8 +218,10 @@ export function createAudio(events) {
   }
 
   // ---------- SFX ----------
-  const panOf = (pos) => (pos && typeof pos.x === 'number' ? clamp(pos.x / 7, -0.8, 0.8) : 0);
-  const distGain = (pos) => (pos && typeof pos.z === 'number' && pos.z < 0 ? 0.72 : 1); // far side quieter
+  // a Team Mint listener sees the court mirrored (camera from -z), so left/right flip too
+  const panOf = (pos) => (pos && typeof pos.x === 'number' ? clamp((perspective.team === 1 ? -pos.x : pos.x) / 7, -0.8, 0.8) : 0);
+  // far side quieter (the far side is z < 0 for Team Peach, z > 0 for a Team Mint listener)
+  const distGain = (pos) => (pos && typeof pos.z === 'number' && pos.z * (perspective.team === 1 ? -1 : 1) < 0 ? 0.72 : 1);
 
   function sfxHit(p) {
     const t = ctx.currentTime;
@@ -383,7 +395,7 @@ export function createAudio(events) {
     const t = ctx.currentTime;
     whistle(t, 0.16, 0.14);
     whistle(t + 0.2, 0.12, 0.12);
-    if (p.winnerTeam === 0) {
+    if (p.winnerTeam === perspective.team) {
       happyJingle(t + 0.4);
       crowdCheer(t + 0.3, 1);
     } else {
@@ -503,7 +515,7 @@ export function createAudio(events) {
   // ---------- events ----------
   // Each handler is a no-op before unlock, while muted, or outside a real match (attract mode).
   const guard = (fn) => (p) => {
-    if (!active || !ready()) return;
+    if (!(active || perspective.live) || !ready()) return;
     try { fn(p || {}); } catch (err) { console.warn('[audio]', err); }
   };
   if (events && typeof events.on === 'function') {
@@ -516,7 +528,7 @@ export function createAudio(events) {
     events.on('bounce', guard(sfxBounce));
     events.on('point', guard(sfxPoint));
     events.on('serveReady', guard(() => whistle(ctx.currentTime + 0.05, 0.2, 0.12)));
-    events.on('matchOver', guard((p) => (p.winnerTeam === 0 ? fanfare : consolation)(ctx.currentTime + 0.3)));
+    events.on('matchOver', guard((p) => (p.winnerTeam === perspective.team ? fanfare : consolation)(ctx.currentTime + 0.3)));
     events.on('pause', guard(() => { blip(false); duckMusic(true); }));
     events.on('resume', guard(() => { blip(true); duckMusic(false); }));
   }
